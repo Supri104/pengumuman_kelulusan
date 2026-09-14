@@ -1,0 +1,439 @@
+/**
+ * ============================================================================
+ * GOOGLE APPS SCRIPT (kode.gs) - SISTEM PENGUMUMAN KELULUSAN SMPN 104 JAKARTA
+ * ============================================================================
+ * File ini digunakan sebagai Web App Backend yang menghubungkan Aplikasi Frontend
+ * atau Server API dengan Google Spreadsheet sebagai basis data utama.
+ * 
+ * CARA MEMASANG:
+ * 1. Buka Google Sheets Anda.
+ * 2. Klik menu Extensi -> Apps Script.
+ * 3. Hapus semua kode yang ada, lalu salin (paste) seluruh isi file ini.
+ * 4. Jalankan fungsi 'setupDatabase()' satu kali untuk membuat sheet & header otomatis.
+ * 5. Klik 'Terapkan' (Deploy) -> 'Terapkan sebagai Aplikasi Web' (Web App Deployment).
+ * 6. Setel 'Akses Siapa Saja' (Anyone) agar dapat diakses oleh web frontend.
+ * ============================================================================
+ */
+
+// Nama-nama Sheet Database
+const SHEET_SISWA_NAME = "Siswa";
+const SHEET_SETTINGS_NAME = "Settings";
+const SHEET_LOGS_NAME = "Logs";
+
+// Daftar Mata Pelajaran Kurikulum Merdeka SMPN 104 Jakarta
+const MAPEL_LIST = [
+  "Pendidikan Agama dan Budi Pekerti",
+  "Pendidikan Pancasila",
+  "Bahasa Indonesia",
+  "Matematika",
+  "Ilmu Pengetahuan Alam (IPA)",
+  "Ilmu Pengetahuan Sosial (IPS)",
+  "Bahasa Inggris",
+  "Pendidikan Jasmani, Olahraga, dan Kesehatan (PJOK)",
+  "Informatika",
+  "Seni dan Budaya / Prakarya"
+];
+
+
+/**
+ * Handler HTTP GET - Digunakan untuk tes koneksi (Ping) atau verifikasi Web App status
+ */
+function doGet(e) {
+  try {
+    const action = e.parameter.action || "ping";
+    
+    if (action === "ping") {
+      return createJsonResponse({
+        status: "success",
+        message: "API Google Apps Script SMPN 104 Jakarta aktif dan terhubung!",
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    if (action === "getStudents") {
+      const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+      const students = getAllStudentsData(sheet);
+      return createJsonResponse({ status: "success", data: students });
+    }
+
+    if (action === "getReleaseDate") {
+      const sheet = getOrInitSheet(SHEET_SETTINGS_NAME);
+      const releaseDate = sheet.getRange("B1").getValue();
+      return createJsonResponse({ status: "success", releaseDate: releaseDate });
+    }
+
+    return createJsonResponse({ status: "error", message: "Aksi GET tidak dikenal." });
+  } catch (err) {
+    return createJsonResponse({ status: "error", message: err.toString() });
+  }
+}
+
+/**
+ * Handler HTTP POST - Menerima perintah JSON dari Frontend / Express Server API
+ */
+function doPost(e) {
+  try {
+    if (!e.postData || !e.postData.contents) {
+      return createJsonResponse({ status: "error", message: "Payload request kosong." });
+    }
+
+    const payload = JSON.parse(e.postData.contents);
+    const action = payload.action;
+
+    switch (action) {
+      case "setup":
+        setupDatabase();
+        return createJsonResponse({ status: "success", message: "Database Google Sheets berhasil diinisialisasi!" });
+
+      case "getStudents":
+        return handleGetStudents();
+
+      case "getStudentByNisn":
+        return handleGetStudentByNisn(payload.nisn, payload.tglLahir);
+
+      case "saveStudent":
+        return handleSaveStudent(payload.student);
+
+      case "importBatch":
+        return handleImportBatch(payload.students);
+
+      case "deleteStudent":
+        return handleDeleteStudent(payload.nisn);
+
+      case "getReleaseDate":
+        return handleGetReleaseDate();
+
+      case "saveReleaseDate":
+        return handleSaveReleaseDate(payload.releaseDate);
+
+      default:
+        return createJsonResponse({ status: "error", message: "Aksi POST tidak valid: " + action });
+    }
+  } catch (err) {
+    writeLog("ERROR", "doPost Exception: " + err.toString());
+    return createJsonResponse({ status: "error", message: err.toString() });
+  }
+}
+
+
+/**
+ * Mengambil seluruh data siswa
+ */
+function handleGetStudents() {
+  const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+  const students = getAllStudentsData(sheet);
+  return createJsonResponse({ status: "success", count: students.length, data: students });
+}
+
+/**
+ * Mencari siswa berdasarkan NISN dan Tanggal Lahir (Format: YYYY-MM-DD)
+ */
+function handleGetStudentByNisn(nisn, tglLahir) {
+  if (!nisn) {
+    return createJsonResponse({ status: "error", message: "NISN wajib diisi." });
+  }
+
+  const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+  const students = getAllStudentsData(sheet);
+  
+  const targetNisn = String(nisn).trim();
+  const targetTgl = tglLahir ? String(tglLahir).trim() : null;
+
+  const found = students.find(s => {
+    const isNisnMatch = String(s.nisn).trim() === targetNisn;
+    if (!targetTgl) return isNisnMatch;
+    return isNisnMatch && (s.tglLahir === targetTgl || formatDateStandard(s.tglLahir) === targetTgl);
+  });
+
+  if (found) {
+    return createJsonResponse({ status: "success", data: found });
+  } else {
+    return createJsonResponse({ status: "error", message: "Data NISN atau Tanggal Lahir tidak cocok." });
+  }
+}
+
+
+/**
+ * Menyimpan atau memperbarui data satu siswa
+ */
+function handleSaveStudent(student) {
+  if (!student || !student.nisn || !student.nama) {
+    return createJsonResponse({ status: "error", message: "Data NISN dan Nama Siswa wajib diisi." });
+  }
+
+  const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+  const rows = sheet.getDataRange().getValues();
+  
+  let targetRowIndex = -1;
+  const searchNisn = String(student.nisn).trim();
+
+  // Cari baris berdasarkan NISN
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]).trim() === searchNisn) {
+      targetRowIndex = i + 1; // 1-based index di Google Sheets
+      break;
+    }
+  }
+
+  const formattedRow = buildStudentRowArray(student);
+
+  if (targetRowIndex > -1) {
+    // Update baris eksisting
+    sheet.getRange(targetRowIndex, 1, 1, formattedRow.length).setValues([formattedRow]);
+    writeLog("UPDATE", "Memperbarui data siswa NISN: " + searchNisn);
+    return createJsonResponse({ status: "success", message: "Data siswa berhasil diperbarui." });
+  } else {
+    // Tambah baris baru
+    sheet.appendRow(formattedRow);
+    writeLog("INSERT", "Menambahkan data siswa baru NISN: " + searchNisn);
+    return createJsonResponse({ status: "success", message: "Data siswa baru berhasil ditambahkan." });
+  }
+}
+
+
+/**
+ * Mengimpor banyak data siswa sekaligus dari Excel / JSON Bulk
+ */
+function handleImportBatch(studentsArray) {
+  if (!Array.isArray(studentsArray) || studentsArray.length === 0) {
+    return createJsonResponse({ status: "error", message: "Data array siswa kosong." });
+  }
+
+  const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+  let successCount = 0;
+
+  studentsArray.forEach(student => {
+    if (student && student.nisn && student.nama) {
+      const rows = sheet.getDataRange().getValues();
+      let targetRowIndex = -1;
+      const searchNisn = String(student.nisn).trim();
+
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]).trim() === searchNisn) {
+          targetRowIndex = i + 1;
+          break;
+        }
+      }
+
+      const rowArr = buildStudentRowArray(student);
+      if (targetRowIndex > -1) {
+        sheet.getRange(targetRowIndex, 1, 1, rowArr.length).setValues([rowArr]);
+      } else {
+        sheet.appendRow(rowArr);
+      }
+      successCount++;
+    }
+  });
+
+  writeLog("BATCH_IMPORT", "Berhasil mengimpor " + successCount + " siswa.");
+  return createJsonResponse({ status: "success", message: "Berhasil mengimpor " + successCount + " data siswa.", count: successCount });
+}
+
+/**
+ * Menghapus data siswa berdasarkan NISN
+ */
+function handleDeleteStudent(nisn) {
+  if (!nisn) {
+    return createJsonResponse({ status: "error", message: "NISN wajib diisi." });
+  }
+
+  const sheet = getOrInitSheet(SHEET_SISWA_NAME);
+  const rows = sheet.getDataRange().getValues();
+  const searchNisn = String(nisn).trim();
+
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]).trim() === searchNisn) {
+      sheet.deleteRow(i + 1);
+      writeLog("DELETE", "Menghapus siswa NISN: " + searchNisn);
+      return createJsonResponse({ status: "success", message: "Data siswa dengan NISN " + nisn + " berhasil dihapus." });
+    }
+  }
+
+  return createJsonResponse({ status: "error", message: "Siswa dengan NISN " + nisn + " tidak ditemukan." });
+}
+
+
+/**
+ * Mengambil waktu rilis pengumuman
+ */
+function handleGetReleaseDate() {
+  const sheet = getOrInitSheet(SHEET_SETTINGS_NAME);
+  const val = sheet.getRange("B1").getValue();
+  return createJsonResponse({ status: "success", releaseDate: String(val) });
+}
+
+/**
+ * Menyimpan jadwal rilis pengumuman
+ */
+function handleSaveReleaseDate(releaseDateStr) {
+  if (!releaseDateStr) {
+    return createJsonResponse({ status: "error", message: "Tanggal rilis tidak boleh kosong." });
+  }
+
+  const sheet = getOrInitSheet(SHEET_SETTINGS_NAME);
+  sheet.getRange("A1").setValue("ReleaseDate");
+  sheet.getRange("B1").setValue(String(releaseDateStr));
+
+  writeLog("SETTINGS", "Mengubah jadwal rilis menjadi: " + releaseDateStr);
+  return createJsonResponse({ status: "success", message: "Jadwal pengumuman berhasil disimpan.", releaseDate: releaseDateStr });
+}
+
+
+/**
+ * Fungsi Setup Utama untuk membuat sheet dan format tabel otomatis
+ */
+function setupDatabase() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. Setup Sheet Siswa
+  let sheetSiswa = ss.getSheetByName(SHEET_SISWA_NAME);
+  if (!sheetSiswa) {
+    sheetSiswa = ss.insertSheet(SHEET_SISWA_NAME);
+  }
+
+  const headersSiswa = [
+    "NISN", "Nama Lengkap", "Kelas", "Tempat Lahir", "Tanggal Lahir", "Status Kelulusan",
+    ...MAPEL_LIST
+  ];
+
+  sheetSiswa.getRange(1, 1, 1, headersSiswa.length)
+    .setValues([headersSiswa])
+    .setFontWeight("bold")
+    .setBackground("#0369a1")
+    .setFontColor("#ffffff")
+    .setHorizontalAlignment("center");
+
+  sheetSiswa.setFrozenRows(1);
+
+  // 2. Setup Sheet Settings
+  let sheetSettings = ss.getSheetByName(SHEET_SETTINGS_NAME);
+  if (!sheetSettings) {
+    sheetSettings = ss.insertSheet(SHEET_SETTINGS_NAME);
+  }
+
+  if (sheetSettings.getRange("A1").getValue() === "") {
+    sheetSettings.getRange("A1").setValue("ReleaseDate");
+    const defaultDate = new Date().toISOString().slice(0, 16);
+    sheetSettings.getRange("B1").setValue(defaultDate);
+  }
+
+  sheetSettings.getRange("A1:B1").setFontWeight("bold");
+
+  // 3. Setup Sheet Logs
+  let sheetLogs = ss.getSheetByName(SHEET_LOGS_NAME);
+  if (!sheetLogs) {
+    sheetLogs = ss.insertSheet(SHEET_LOGS_NAME);
+    sheetLogs.getRange(1, 1, 1, 3)
+      .setValues([["Timestamp", "Kategori", "Keterangan"]])
+      .setFontWeight("bold")
+      .setBackground("#334155")
+      .setFontColor("#ffffff");
+    sheetLogs.setFrozenRows(1);
+  }
+
+  writeLog("SETUP", "Database SMPN 104 Jakarta berhasil dikonfigurasi.");
+}
+
+/**
+ * Helpert Ambil/Buat Sheet jika belum ada
+ */
+function getOrInitSheet(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    setupDatabase();
+    sheet = ss.getSheetByName(sheetName);
+  }
+  return sheet;
+}
+
+/**
+ * Mengubah array baris Google Sheets menjadi struktur Object Siswa
+ */
+function getAllStudentsData(sheet) {
+  const rows = sheet.getDataRange().getValues();
+  if (rows.length <= 1) return [];
+
+  const students = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row[0]) continue; // Lewati baris tanpa NISN
+
+    const nilaiObj = {};
+    MAPEL_LIST.forEach((mapel, index) => {
+      const colIndex = 6 + index; // Nilai dimulai dari kolom ke-7 (Index 6)
+      nilaiObj[mapel] = Number(row[colIndex]) || 0;
+    });
+
+    students.push({
+      nisn: String(row[0]).trim(),
+      nama: String(row[1]).trim(),
+      kelas: String(row[2]).trim(),
+      tempatLahir: String(row[3]).trim(),
+      tglLahir: formatDateStandard(row[4]),
+      status: String(row[5]).trim().toUpperCase(),
+      nilai: nilaiObj
+    });
+  }
+
+  return students;
+}
+
+/**
+ * Menyusun Array Baris untuk dimasukkan ke Google Sheets
+ */
+function buildStudentRowArray(student) {
+  const row = [
+    String(student.nisn).trim(),
+    student.nama || "",
+    student.kelas || "9A",
+    student.tempatLahir || "Jakarta",
+    student.tglLahir || "2009-01-01",
+    (student.status || "LULUS").toUpperCase()
+  ];
+
+  MAPEL_LIST.forEach(mapel => {
+    const val = student.nilai && student.nilai[mapel] !== undefined ? Number(student.nilai[mapel]) : 80;
+    row.push(val);
+  });
+
+  return row;
+}
+
+/**
+ * Format tanggal ke standar YYYY-MM-DD
+ */
+function formatDateStandard(val) {
+  if (!val) return "";
+  if (val instanceof Date) {
+    const year = val.getFullYear();
+    const month = String(val.getMonth() + 1).padStart(2, '0');
+    const day = String(val.getDate()).padStart(2, '0');
+    return year + "-" + month + "-" + day;
+  }
+  return String(val).trim();
+}
+
+/**
+ * Helper Output JSON dengan header CORS lengkap
+ */
+function createJsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Catat aktivitas log ke sheet 'Logs'
+ */
+function writeLog(kategori, pesan) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheetLogs = ss.getSheetByName(SHEET_LOGS_NAME);
+    if (sheetLogs) {
+      sheetLogs.appendRow([new Date(), kategori, pesan]);
+    }
+  } catch (e) {
+    console.error("Gagal menulis log:", e);
+  }
+}
